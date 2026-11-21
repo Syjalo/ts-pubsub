@@ -1,0 +1,42 @@
+{
+  "name": "@syjalo/pubsub",
+  "version": "0.1.0",
+  "description": "Type-safe PubSub with AsyncGenerator and Web Streams support",
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "pnpm build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Syjalo/ts-pubsub.git"
+  },
+  "keywords": ["pubsub", "event-emitter", "event-bus"],
+  "author": "Synbulat Biishev <me@syjalo.dev>",
+  "license": "MIT",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "12.21.0",
+      "onFail": "download"
+    }
+  },
+  "packageManager": "pnpm@12.21.0",
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}
