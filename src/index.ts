@@ -1,115 +1,113 @@
-type TopicMap = Record<string, unknown[]>;
-type TopicShape<T> = { [K in keyof T]: unknown[] };
-type TopicMessage<T extends TopicShape<T>> = {
+export type TopicMap = Record<string, unknown[]>;
+export type TopicShape<T> = { [K in keyof T]: unknown[] };
+export type TopicMessage<T extends TopicShape<T>> = {
   [K in keyof T]: [K, ...T[K]];
 }[keyof T];
 
-type Subscriber<Args extends unknown[] = any[]> = ((...args: Args) => void) & {
-  original?: (...args: Args) => void;
-};
-
-interface SubOptions {
+export interface SubOptions<Args extends unknown[] = unknown[]> {
   signal?: AbortSignal;
+  filter?: (...args: Args) => boolean;
+}
+
+export interface CollectOptions<Args extends unknown[] = unknown[]>
+  extends SubOptions<Args> {
+  max?: number;
+  time?: number;
+  idle?: number;
+}
+
+interface TopicSubscription {
+  subscriber: unknown;
+  active: boolean;
+  removeAbortListener: () => void;
+  dispatch: (args: unknown[]) => void;
 }
 
 function getAbortReason(signal: AbortSignal): unknown {
   return signal.reason ?? new DOMException("Aborted", "AbortError");
 }
 
-class PubSub<T extends TopicShape<T> = TopicMap> {
-  private subscribers = new Map<keyof T, Map<Subscriber, () => void>>();
+export class PubSub<T extends TopicShape<T> = TopicMap> {
+  private topicSubscriptions = new Map<
+    keyof T,
+    Map<unknown, TopicSubscription>
+  >();
   private wildcardSubscribers = new Set<(message: TopicMessage<T>) => void>();
 
   public pub<K extends keyof T>(topic: K, ...args: T[K]): void {
-    const subs = this.subscribers.get(topic);
-    if (subs) {
-      for (const subscriber of [...subs.keys()]) {
-        subscriber(...args);
+    const subscriptions = this.topicSubscriptions.get(topic);
+    if (subscriptions) {
+      for (const subscription of [...subscriptions.values()]) {
+        if (subscription.active) {
+          subscription.dispatch(args);
+        }
       }
     }
 
     if (this.wildcardSubscribers.size > 0) {
       const message = [topic, ...args] as TopicMessage<T>;
       for (const subscriber of [...this.wildcardSubscribers]) {
-        subscriber(message);
+        if (this.wildcardSubscribers.has(subscriber)) {
+          subscriber(message);
+        }
       }
     }
   }
 
   public sub<K extends keyof T>(
     topic: K,
-    options?: SubOptions,
+    options?: SubOptions<T[K]>,
   ): AsyncGenerator<T[K]>;
   public sub<K extends keyof T>(
     topic: K,
     subscriber: (...args: T[K]) => void,
-    options?: SubOptions,
+    options?: SubOptions<T[K]>,
   ): () => void;
   public sub<K extends keyof T>(
     topic: K,
-    subscriberOrOptions?: ((...args: T[K]) => void) | SubOptions,
-    options?: SubOptions,
+    subscriberOrOptions?: ((...args: T[K]) => void) | SubOptions<T[K]>,
+    options?: SubOptions<T[K]>,
   ): (() => void) | AsyncGenerator<T[K]> {
     if (typeof subscriberOrOptions !== "function") {
-      return this.createAsyncIterable<T[K]>(
-        (push) => this.sub(topic, (...args) => push(args)),
+      return this.createAsyncGenerator<T[K]>(
+        (push) =>
+          this.sub(topic, (...args) => push(args), {
+            filter: subscriberOrOptions?.filter,
+          }),
         subscriberOrOptions?.signal,
       );
     }
 
-    const subscriber = subscriberOrOptions;
-    const signal = options?.signal;
-    if (signal?.aborted) return () => {};
-
-    let subs = this.subscribers.get(topic);
-    if (!subs) {
-      subs = new Map();
-      this.subscribers.set(topic, subs);
-    } else {
-      // Detach any prior abort listener if re-subscribing the same reference
-      subs.get(subscriber)?.();
-    }
-
-    const onAbort = () => this.unsub(topic, subscriber);
-    signal?.addEventListener("abort", onAbort, { once: true });
-    subs.set(subscriber, () => signal?.removeEventListener("abort", onAbort));
-
-    return () => this.unsub(topic, subscriber);
+    return this.addSubscription(topic, subscriberOrOptions, options);
   }
 
   public unsub<K extends keyof T>(
     topic: K,
     subscriber: (...args: T[K]) => void,
   ): void {
-    const subs = this.subscribers.get(topic);
-    if (!subs) return;
+    const subscriptions = this.topicSubscriptions.get(topic);
+    if (!subscriptions) return;
 
-    this.removeEntry(subs, subscriber);
-
-    for (const item of [...subs.keys()]) {
-      if (item.original === subscriber) {
-        this.removeEntry(subs, item);
+    for (const [key, subscription] of [...subscriptions.entries()]) {
+      if (subscription.subscriber === subscriber) {
+        this.removeSubscription(topic, subscriptions, key, subscription);
       }
-    }
-
-    if (subs.size === 0) {
-      this.subscribers.delete(topic);
     }
   }
 
   public once<K extends keyof T>(
     topic: K,
-    options?: SubOptions,
+    options?: SubOptions<T[K]>,
   ): Promise<T[K]>;
   public once<K extends keyof T>(
     topic: K,
     subscriber: (...args: T[K]) => void,
-    options?: SubOptions,
+    options?: SubOptions<T[K]>,
   ): () => void;
   public once<K extends keyof T>(
     topic: K,
-    subscriberOrOptions?: ((...args: T[K]) => void) | SubOptions,
-    options?: SubOptions,
+    subscriberOrOptions?: ((...args: T[K]) => void) | SubOptions<T[K]>,
+    options?: SubOptions<T[K]>,
   ): Promise<T[K]> | (() => void) {
     if (typeof subscriberOrOptions !== "function") {
       const signal = subscriberOrOptions?.signal;
@@ -123,67 +121,66 @@ class PubSub<T extends TopicShape<T> = TopicMap> {
       const onAbort = () => {
         if (settled) return;
         settled = true;
-        unsub();
+        unsubscribe();
         reject(getAbortReason(signal!));
       };
 
-      const unsub = this.once(topic, (...args) => {
-        if (settled) return;
-        settled = true;
-        signal?.removeEventListener("abort", onAbort);
-        resolve(args);
-      });
+      const unsubscribe = this.addSubscription(
+        topic,
+        (...args) => {
+          if (settled) return;
+          settled = true;
+          signal?.removeEventListener("abort", onAbort);
+          resolve(args);
+        },
+        { filter: subscriberOrOptions?.filter, once: true },
+      );
 
       signal?.addEventListener("abort", onAbort, { once: true });
       return promise;
     }
 
-    const subscriber = subscriberOrOptions;
-    const wrapper: Subscriber<T[K]> = (...args) => {
-      unsubscribe();
-      subscriber(...args);
-    };
-    wrapper.original = subscriber;
-
-    const unsubscribe = this.sub(topic, wrapper, options);
-    return unsubscribe;
+    return this.addSubscription(topic, subscriberOrOptions, {
+      ...options,
+      once: true,
+    });
   }
 
   public clear(topic?: keyof T): void {
     if (topic !== undefined) {
-      const subs = this.subscribers.get(topic);
-      if (subs) {
-        for (const cleanup of subs.values()) cleanup();
-        this.subscribers.delete(topic);
+      const subscriptions = this.topicSubscriptions.get(topic);
+      if (subscriptions) {
+        this.clearTopicSubscriptions(subscriptions);
+        this.topicSubscriptions.delete(topic);
       }
       return;
     }
 
-    for (const subs of this.subscribers.values()) {
-      for (const cleanup of subs.values()) cleanup();
+    for (const subscriptions of this.topicSubscriptions.values()) {
+      this.clearTopicSubscriptions(subscriptions);
     }
-    this.subscribers.clear();
+    this.topicSubscriptions.clear();
     this.wildcardSubscribers.clear();
   }
 
   public count(topic?: keyof T): number {
     if (topic !== undefined) {
-      return this.subscribers.get(topic)?.size ?? 0;
+      return this.topicSubscriptions.get(topic)?.size ?? 0;
     }
     let total = this.wildcardSubscribers.size;
-    for (const subs of this.subscribers.values()) {
-      total += subs.size;
+    for (const subscriptions of this.topicSubscriptions.values()) {
+      total += subscriptions.size;
     }
     return total;
   }
 
   public topics(): (keyof T)[] {
-    return [...this.subscribers.keys()];
+    return [...this.topicSubscriptions.keys()];
   }
 
   public [Symbol.asyncIterator](): AsyncGenerator<TopicMessage<T>> {
-    return this.createAsyncIterable<TopicMessage<T>>((push) =>
-      this.subAll(push),
+    return this.createAsyncGenerator<TopicMessage<T>>((push) =>
+      this.addWildcardSubscriber(push),
     );
   }
 
@@ -193,10 +190,12 @@ class PubSub<T extends TopicShape<T> = TopicMap> {
     topic?: K,
   ): ReadableStream<TopicMessage<T>> | ReadableStream<T[K]> {
     return topic !== undefined
-      ? this.createReadable<T[K]>((push) =>
+      ? this.createReadableStream<T[K]>((push) =>
           this.sub(topic, (...args) => push(args)),
         )
-      : this.createReadable<TopicMessage<T>>((push) => this.subAll(push));
+      : this.createReadableStream<TopicMessage<T>>((push) =>
+          this.addWildcardSubscriber(push),
+        );
   }
 
   public writable(): WritableStream<TopicMessage<T>>;
@@ -213,40 +212,120 @@ class PubSub<T extends TopicShape<T> = TopicMap> {
     }
 
     return new WritableStream<TopicMessage<T>>({
-      write: ([topicName, ...args]) => {
-        this.pub(topicName, ...(args as any));
+      write: ([messageTopic, ...args]) => {
+        this.pub(messageTopic, ...(args as T[typeof messageTopic]));
       },
     });
   }
 
-  private removeEntry(
-    subs: Map<Subscriber, () => void>,
-    subscriber: Subscriber,
+  private addSubscription<K extends keyof T>(
+    topic: K,
+    subscriber: (...args: T[K]) => void,
+    options?: SubOptions<T[K]> & { once?: boolean },
+  ): () => void {
+    const signal = options?.signal;
+    if (signal?.aborted) return () => {};
+
+    const filter = options?.filter;
+    const once = options?.once ?? false;
+    const key: unknown = filter || once ? Symbol() : subscriber;
+
+    let subscriptions = this.topicSubscriptions.get(topic);
+    if (!subscriptions) {
+      subscriptions = new Map();
+      this.topicSubscriptions.set(topic, subscriptions);
+    } else if (key === subscriber) {
+      // Replace any prior registration for the same bare subscriber
+      const existing = subscriptions.get(key);
+      if (existing) {
+        existing.active = false;
+        existing.removeAbortListener();
+      }
+    }
+
+    const onAbort = () =>
+      this.removeSubscription(topic, subscriptions, key, subscription);
+
+    const subscription: TopicSubscription = {
+      subscriber,
+      active: true,
+      removeAbortListener: () => signal?.removeEventListener("abort", onAbort),
+      dispatch: (args: unknown[]) => {
+        const typedArgs = args as T[K];
+        if (filter && !filter(...typedArgs)) return;
+        if (once) {
+          this.removeSubscription(topic, subscriptions, key, subscription);
+        }
+        subscriber(...typedArgs);
+      },
+    };
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+    subscriptions.set(key, subscription);
+
+    return () =>
+      this.removeSubscription(topic, subscriptions, key, subscription);
+  }
+
+  private removeSubscription(
+    topic: keyof T,
+    subscriptions: Map<unknown, TopicSubscription>,
+    key: unknown,
+    subscription: TopicSubscription,
   ): void {
-    const cleanup = subs.get(subscriber);
-    if (!cleanup) return;
-    cleanup();
-    subs.delete(subscriber);
+    if (!subscription.active) return;
+    subscription.active = false;
+    subscription.removeAbortListener();
+    subscriptions.delete(key);
+    if (
+      subscriptions.size === 0 &&
+      this.topicSubscriptions.get(topic) === subscriptions
+    ) {
+      this.topicSubscriptions.delete(topic);
+    }
   }
 
-  private subAll(subscriber: (message: TopicMessage<T>) => void): () => void {
+  private clearTopicSubscriptions(
+    subscriptions: Map<unknown, TopicSubscription>,
+  ): void {
+    for (const subscription of subscriptions.values()) {
+      subscription.active = false;
+      subscription.removeAbortListener();
+    }
+    subscriptions.clear();
+  }
+
+  private addWildcardSubscriber(
+    subscriber: (message: TopicMessage<T>) => void,
+  ): () => void {
     this.wildcardSubscribers.add(subscriber);
-    return () => this.wildcardSubscribers.delete(subscriber);
+    return () => {
+      this.wildcardSubscribers.delete(subscriber);
+    };
   }
 
-  private createReadable<U>(
+  private createReadableStream<U>(
     subscribe: (push: (item: U) => void) => () => void,
   ): ReadableStream<U> {
     let unsubscribe = () => {};
+    let closed = false;
+
     return new ReadableStream<U>({
       start: (controller) => {
-        unsubscribe = subscribe((item) => controller.enqueue(item));
+        unsubscribe = subscribe((item) => {
+          if (!closed) {
+            controller.enqueue(item);
+          }
+        });
       },
-      cancel: () => unsubscribe(),
+      cancel: () => {
+        closed = true;
+        unsubscribe();
+      },
     });
   }
 
-  private createAsyncIterable<U>(
+  private createAsyncGenerator<U>(
     subscribe: (push: (item: U) => void) => () => void,
     signal?: AbortSignal,
   ): AsyncGenerator<U> {
@@ -255,23 +334,23 @@ class PubSub<T extends TopicShape<T> = TopicMap> {
     }
 
     let queue: U[] = [];
-    let notify: (() => void) | null = null;
-    let done = false;
+    let resolveNext: (() => void) | null = null;
+    let stopped = false;
 
     const wake = () => {
-      notify?.();
-      notify = null;
+      resolveNext?.();
+      resolveNext = null;
     };
 
     const unsubscribe = subscribe((item) => {
-      if (done) return;
+      if (stopped) return;
       queue.push(item);
       wake();
     });
 
     const stop = () => {
-      if (done) return;
-      done = true;
+      if (stopped) return;
+      stopped = true;
       signal?.removeEventListener("abort", stop);
       unsubscribe();
       wake();
@@ -281,19 +360,19 @@ class PubSub<T extends TopicShape<T> = TopicMap> {
 
     const generator = (async function* () {
       try {
-        while (!done) {
+        while (!stopped) {
           if (queue.length > 0) {
             const batch = queue;
             queue = [];
             for (const item of batch) {
-              if (done) return;
+              if (stopped) return;
               yield item;
             }
             continue;
           }
 
           const { promise, resolve } = Promise.withResolvers<void>();
-          notify = resolve;
+          resolveNext = resolve;
           await promise;
         }
       } finally {
@@ -301,21 +380,94 @@ class PubSub<T extends TopicShape<T> = TopicMap> {
       }
     })();
 
-    const origReturn = generator.return.bind(generator);
+    const baseReturn = generator.return.bind(generator);
     generator.return = (value) => {
       stop();
-      return origReturn(value);
+      return baseReturn(value);
     };
 
-    const origThrow = generator.throw.bind(generator);
+    const baseThrow = generator.throw.bind(generator);
     generator.throw = (err) => {
       stop();
-      return origThrow(err);
+      return baseThrow(err);
     };
 
     return generator;
   }
 }
 
-export { PubSub };
-export type { TopicMap, TopicMessage, SubOptions };
+export function collect<T extends TopicShape<T>, K extends keyof T>(
+  pubsub: PubSub<T>,
+  topic: K,
+  options?: CollectOptions<T[K]>,
+): Promise<T[K][]> {
+  const signal = options?.signal;
+  if (signal?.aborted) {
+    return Promise.reject(getAbortReason(signal));
+  }
+
+  const { max, time, idle, filter } = options ?? {};
+
+  if (
+    (max !== undefined && max <= 0) ||
+    (time !== undefined && time <= 0) ||
+    (idle !== undefined && idle <= 0)
+  ) {
+    return Promise.resolve([]);
+  }
+
+  const { promise, resolve, reject } = Promise.withResolvers<T[K][]>();
+  const collected: T[K][] = [];
+  let settled = false;
+  let durationTimer: ReturnType<typeof setTimeout> | undefined;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const cleanup = () => {
+    clearTimeout(durationTimer);
+    clearTimeout(idleTimer);
+    signal?.removeEventListener("abort", onAbort);
+    unsubscribe();
+  };
+
+  const complete = () => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    resolve(collected);
+  };
+
+  const onAbort = () => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    reject(getAbortReason(signal!));
+  };
+
+  const resetIdleTimer = () => {
+    if (idle === undefined || !Number.isFinite(idle)) return;
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(complete, idle);
+  };
+
+  const unsubscribe = pubsub.sub(
+    topic,
+    (...args) => {
+      if (settled) return;
+      collected.push(args);
+      if (max !== undefined && collected.length >= max) {
+        complete();
+        return;
+      }
+      resetIdleTimer();
+    },
+    { filter },
+  );
+
+  if (time !== undefined && Number.isFinite(time)) {
+    durationTimer = setTimeout(complete, time);
+  }
+  resetIdleTimer();
+  signal?.addEventListener("abort", onAbort, { once: true });
+
+  return promise;
+}
