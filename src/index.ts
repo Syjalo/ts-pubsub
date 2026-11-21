@@ -9,8 +9,15 @@ export interface SubOptions<Args extends unknown[] = unknown[]> {
   filter?: (...args: Args) => boolean;
 }
 
-export interface CollectOptions<Args extends unknown[] = unknown[]>
+export interface SubIterOptions<Args extends unknown[] = unknown[]>
   extends SubOptions<Args> {
+  max?: number;
+  time?: number;
+  idle?: number;
+}
+
+interface AsyncStreamOptions {
+  signal?: AbortSignal;
   max?: number;
   time?: number;
   idle?: number;
@@ -19,9 +26,11 @@ export interface CollectOptions<Args extends unknown[] = unknown[]>
 interface TopicSubscription {
   subscriber: unknown;
   active: boolean;
-  removeAbortListener: () => void;
+  cleanup: () => void;
   dispatch: (args: unknown[]) => void;
 }
+
+const NOOP = () => {};
 
 function getAbortReason(signal: AbortSignal): unknown {
   return signal.reason ?? new DOMException("Aborted", "AbortError");
@@ -56,7 +65,7 @@ export class PubSub<T extends TopicShape<T> = TopicMap> {
 
   public sub<K extends keyof T>(
     topic: K,
-    options?: SubOptions<T[K]>,
+    options?: SubIterOptions<T[K]>,
   ): AsyncGenerator<T[K]>;
   public sub<K extends keyof T>(
     topic: K,
@@ -65,16 +74,16 @@ export class PubSub<T extends TopicShape<T> = TopicMap> {
   ): () => void;
   public sub<K extends keyof T>(
     topic: K,
-    subscriberOrOptions?: ((...args: T[K]) => void) | SubOptions<T[K]>,
+    subscriberOrOptions?: ((...args: T[K]) => void) | SubIterOptions<T[K]>,
     options?: SubOptions<T[K]>,
   ): (() => void) | AsyncGenerator<T[K]> {
     if (typeof subscriberOrOptions !== "function") {
       return this.createAsyncGenerator<T[K]>(
         (push) =>
-          this.sub(topic, (...args) => push(args), {
+          this.addSubscription(topic, (...args) => push(args), {
             filter: subscriberOrOptions?.filter,
           }),
-        subscriberOrOptions?.signal,
+        subscriberOrOptions,
       );
     }
 
@@ -110,34 +119,7 @@ export class PubSub<T extends TopicShape<T> = TopicMap> {
     options?: SubOptions<T[K]>,
   ): Promise<T[K]> | (() => void) {
     if (typeof subscriberOrOptions !== "function") {
-      const signal = subscriberOrOptions?.signal;
-      if (signal?.aborted) {
-        return Promise.reject(getAbortReason(signal));
-      }
-
-      const { promise, resolve, reject } = Promise.withResolvers<T[K]>();
-      let settled = false;
-
-      const onAbort = () => {
-        if (settled) return;
-        settled = true;
-        unsubscribe();
-        reject(getAbortReason(signal!));
-      };
-
-      const unsubscribe = this.addSubscription(
-        topic,
-        (...args) => {
-          if (settled) return;
-          settled = true;
-          signal?.removeEventListener("abort", onAbort);
-          resolve(args);
-        },
-        { filter: subscriberOrOptions?.filter, once: true },
-      );
-
-      signal?.addEventListener("abort", onAbort, { once: true });
-      return promise;
+      return this.oncePromise(topic, subscriberOrOptions);
     }
 
     return this.addSubscription(topic, subscriberOrOptions, {
@@ -191,7 +173,7 @@ export class PubSub<T extends TopicShape<T> = TopicMap> {
   ): ReadableStream<TopicMessage<T>> | ReadableStream<T[K]> {
     return topic !== undefined
       ? this.createReadableStream<T[K]>((push) =>
-          this.sub(topic, (...args) => push(args)),
+          this.addSubscription(topic, (...args) => push(args)),
         )
       : this.createReadableStream<TopicMessage<T>>((push) =>
           this.addWildcardSubscriber(push),
@@ -218,13 +200,47 @@ export class PubSub<T extends TopicShape<T> = TopicMap> {
     });
   }
 
+  private oncePromise<K extends keyof T>(
+    topic: K,
+    options?: SubOptions<T[K]>,
+  ): Promise<T[K]> {
+    const signal = options?.signal;
+    if (signal?.aborted) {
+      return Promise.reject(getAbortReason(signal));
+    }
+
+    const { promise, resolve, reject } = Promise.withResolvers<T[K]>();
+    let settled = false;
+
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      unsubscribe();
+      reject(getAbortReason(signal!));
+    };
+
+    const unsubscribe = this.addSubscription(
+      topic,
+      (...args) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener("abort", onAbort);
+        resolve(args);
+      },
+      { filter: options?.filter, once: true },
+    );
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+    return promise;
+  }
+
   private addSubscription<K extends keyof T>(
     topic: K,
     subscriber: (...args: T[K]) => void,
     options?: SubOptions<T[K]> & { once?: boolean },
   ): () => void {
     const signal = options?.signal;
-    if (signal?.aborted) return () => {};
+    if (signal?.aborted) return NOOP;
 
     const filter = options?.filter;
     const once = options?.once ?? false;
@@ -238,21 +254,18 @@ export class PubSub<T extends TopicShape<T> = TopicMap> {
       // Replace any prior registration for the same bare subscriber
       const existing = subscriptions.get(key);
       if (existing) {
-        existing.active = false;
-        existing.removeAbortListener();
+        this.deactivateSubscription(existing);
       }
     }
-
-    const onAbort = () =>
-      this.removeSubscription(topic, subscriptions, key, subscription);
 
     const subscription: TopicSubscription = {
       subscriber,
       active: true,
-      removeAbortListener: () => signal?.removeEventListener("abort", onAbort),
+      cleanup: NOOP,
       dispatch: (args: unknown[]) => {
         const typedArgs = args as T[K];
         if (filter && !filter(...typedArgs)) return;
+        if (!subscription.active) return;
         if (once) {
           this.removeSubscription(topic, subscriptions, key, subscription);
         }
@@ -260,11 +273,23 @@ export class PubSub<T extends TopicShape<T> = TopicMap> {
       },
     };
 
-    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal) {
+      const onAbort = () =>
+        this.removeSubscription(topic, subscriptions, key, subscription);
+      signal.addEventListener("abort", onAbort, { once: true });
+      subscription.cleanup = () => signal.removeEventListener("abort", onAbort);
+    }
+
     subscriptions.set(key, subscription);
 
     return () =>
       this.removeSubscription(topic, subscriptions, key, subscription);
+  }
+
+  private deactivateSubscription(subscription: TopicSubscription): void {
+    subscription.active = false;
+    subscription.cleanup();
+    subscription.cleanup = NOOP;
   }
 
   private removeSubscription(
@@ -274,8 +299,7 @@ export class PubSub<T extends TopicShape<T> = TopicMap> {
     subscription: TopicSubscription,
   ): void {
     if (!subscription.active) return;
-    subscription.active = false;
-    subscription.removeAbortListener();
+    this.deactivateSubscription(subscription);
     subscriptions.delete(key);
     if (
       subscriptions.size === 0 &&
@@ -289,8 +313,7 @@ export class PubSub<T extends TopicShape<T> = TopicMap> {
     subscriptions: Map<unknown, TopicSubscription>,
   ): void {
     for (const subscription of subscriptions.values()) {
-      subscription.active = false;
-      subscription.removeAbortListener();
+      this.deactivateSubscription(subscription);
     }
     subscriptions.clear();
   }
@@ -307,167 +330,152 @@ export class PubSub<T extends TopicShape<T> = TopicMap> {
   private createReadableStream<U>(
     subscribe: (push: (item: U) => void) => () => void,
   ): ReadableStream<U> {
-    let unsubscribe = () => {};
+    let unsubscribe = NOOP;
     let closed = false;
 
     return new ReadableStream<U>({
       start: (controller) => {
-        unsubscribe = subscribe((item) => {
+        const unsub = subscribe((item) => {
           if (!closed) {
             controller.enqueue(item);
           }
         });
+        if (closed) {
+          unsub();
+        } else {
+          unsubscribe = unsub;
+        }
       },
       cancel: () => {
         closed = true;
         unsubscribe();
+        unsubscribe = NOOP;
       },
     });
   }
 
   private createAsyncGenerator<U>(
     subscribe: (push: (item: U) => void) => () => void,
-    signal?: AbortSignal,
+    options?: AsyncStreamOptions,
   ): AsyncGenerator<U> {
-    if (signal?.aborted) {
+    const { signal, max, time, idle } = options ?? {};
+
+    if (
+      signal?.aborted ||
+      (max !== undefined && max <= 0) ||
+      (time !== undefined && time <= 0) ||
+      (idle !== undefined && idle <= 0)
+    ) {
       return (async function* () {})();
     }
 
     let queue: U[] = [];
     let resolveNext: (() => void) | null = null;
-    let stopped = false;
+    let count = 0;
+    let ended = false;
+    let aborted = false;
+    let cleanedUp = false;
+    let durationTimer: ReturnType<typeof setTimeout> | undefined;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    let unsubscribe = NOOP;
 
     const wake = () => {
       resolveNext?.();
       resolveNext = null;
     };
 
-    const unsubscribe = subscribe((item) => {
-      if (stopped) return;
-      queue.push(item);
-      wake();
-    });
-
-    const stop = () => {
-      if (stopped) return;
-      stopped = true;
-      signal?.removeEventListener("abort", stop);
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      clearTimeout(durationTimer);
+      clearTimeout(idleTimer);
+      signal?.removeEventListener("abort", abort);
       unsubscribe();
+      unsubscribe = NOOP;
+    };
+
+    const end = () => {
+      if (ended) return;
+      ended = true;
+      cleanup();
       wake();
     };
 
-    signal?.addEventListener("abort", stop, { once: true });
+    const abort = () => {
+      if (aborted) return;
+      aborted = true;
+      ended = true;
+      queue = [];
+      cleanup();
+      wake();
+    };
+
+    const resetIdleTimer = () => {
+      if (idle === undefined || !Number.isFinite(idle)) return;
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(end, idle);
+    };
+
+    const unsub = subscribe((item) => {
+      if (ended) return;
+      queue.push(item);
+      count++;
+      if (max !== undefined && count >= max) {
+        end();
+        return;
+      }
+      resetIdleTimer();
+      wake();
+    });
+
+    if (ended) {
+      unsub();
+    } else {
+      unsubscribe = unsub;
+      if (time !== undefined && Number.isFinite(time)) {
+        durationTimer = setTimeout(end, time);
+      }
+      resetIdleTimer();
+      signal?.addEventListener("abort", abort, { once: true });
+    }
 
     const generator = (async function* () {
       try {
-        while (!stopped) {
+        while (!aborted) {
           if (queue.length > 0) {
             const batch = queue;
             queue = [];
             for (const item of batch) {
-              if (stopped) return;
+              if (aborted) return;
               yield item;
             }
             continue;
           }
+
+          if (ended) return;
 
           const { promise, resolve } = Promise.withResolvers<void>();
           resolveNext = resolve;
           await promise;
         }
       } finally {
-        stop();
+        abort();
       }
     })();
 
+    // Ensure cleanup runs even if return/throw is called before the first next()
     const baseReturn = generator.return.bind(generator);
     generator.return = (value) => {
-      stop();
+      abort();
       return baseReturn(value);
     };
 
     const baseThrow = generator.throw.bind(generator);
     generator.throw = (err) => {
-      stop();
+      abort();
       return baseThrow(err);
     };
 
     return generator;
   }
-}
-
-export function collect<T extends TopicShape<T>, K extends keyof T>(
-  pubsub: PubSub<T>,
-  topic: K,
-  options?: CollectOptions<T[K]>,
-): Promise<T[K][]> {
-  const signal = options?.signal;
-  if (signal?.aborted) {
-    return Promise.reject(getAbortReason(signal));
-  }
-
-  const { max, time, idle, filter } = options ?? {};
-
-  if (
-    (max !== undefined && max <= 0) ||
-    (time !== undefined && time <= 0) ||
-    (idle !== undefined && idle <= 0)
-  ) {
-    return Promise.resolve([]);
-  }
-
-  const { promise, resolve, reject } = Promise.withResolvers<T[K][]>();
-  const collected: T[K][] = [];
-  let settled = false;
-  let durationTimer: ReturnType<typeof setTimeout> | undefined;
-  let idleTimer: ReturnType<typeof setTimeout> | undefined;
-
-  const cleanup = () => {
-    clearTimeout(durationTimer);
-    clearTimeout(idleTimer);
-    signal?.removeEventListener("abort", onAbort);
-    unsubscribe();
-  };
-
-  const complete = () => {
-    if (settled) return;
-    settled = true;
-    cleanup();
-    resolve(collected);
-  };
-
-  const onAbort = () => {
-    if (settled) return;
-    settled = true;
-    cleanup();
-    reject(getAbortReason(signal!));
-  };
-
-  const resetIdleTimer = () => {
-    if (idle === undefined || !Number.isFinite(idle)) return;
-    clearTimeout(idleTimer);
-    idleTimer = setTimeout(complete, idle);
-  };
-
-  const unsubscribe = pubsub.sub(
-    topic,
-    (...args) => {
-      if (settled) return;
-      collected.push(args);
-      if (max !== undefined && collected.length >= max) {
-        complete();
-        return;
-      }
-      resetIdleTimer();
-    },
-    { filter },
-  );
-
-  if (time !== undefined && Number.isFinite(time)) {
-    durationTimer = setTimeout(complete, time);
-  }
-  resetIdleTimer();
-  signal?.addEventListener("abort", onAbort, { once: true });
-
-  return promise;
 }

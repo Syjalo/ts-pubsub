@@ -6,9 +6,9 @@ A lightweight, strictly-typed PubSub library for TypeScript and JavaScript with 
 
 - **Strict TypeScript types** — Supports both `interface` and `type` event maps with tuple arguments.
 - **Zero dependencies** — Built purely on standard Web & ECMAScript APIs (`AbortSignal`, `ReadableStream`, `WritableStream`, `AsyncGenerator`).
-- **Flexible consumption** — Subscribe with callbacks, `await` single events with `once()`, batch events with `collect()`, iterate with `for await...of`, or pipe Web Streams.
-- **Predicate filtering** — Filter events inline with `{ filter }` across `sub()`, `once()`, and `collect()`.
-- **Built-in cancellation** — First-class `AbortSignal` support for callbacks, promises, `collect()`, and async iterators.
+- **Flexible consumption** — Subscribe with callbacks, `await` single events with `once()`, iterate with `for await...of`, or pipe Web Streams.
+- **Bounded & filtered iteration** — Limit async iterators with `{ filter, max, time, idle }`.
+- **Built-in cancellation** — First-class `AbortSignal` support for callbacks, promises, and async iterators.
 - **Wildcard streaming** — Iterate or stream all topics at once as discriminated `[topic, ...args]` tuples.
 
 ## Installation
@@ -75,7 +75,7 @@ console.log("Logged in:", userId);
 
 ### Filtering Events
 
-Pass `{ filter }` to `sub()`, `once()`, or `collect()` to handle only matching events:
+Pass `{ filter }` to `sub()` or `once()` to handle only matching events:
 
 ```ts
 // Only handle messages from Alice
@@ -85,31 +85,15 @@ const unsubscribe = pubsub.sub(
   { filter: (user) => user === "Alice" },
 );
 
-// Wait for a specific user to log in
+// Wait for an admin login
 const [userId] = await pubsub.once("user:login", {
   filter: (id) => id.startsWith("admin_"),
 });
 ```
 
-### Collecting Events (`collect()`)
-
-Gather multiple events into an array of argument tuples based on count, total duration, or inactivity timeout:
-
-```ts
-import { collect } from "@syjalo/pubsub";
-
-// Collect up to 5 messages from Alice, stopping after 2s total or 500ms of inactivity
-const messages = await collect(pubsub, "chat:message", {
-  max: 5,
-  time: 2000,
-  idle: 500,
-  filter: (user) => user === "Alice",
-});
-```
-
 ### Cancellation with `AbortSignal`
 
-Pass `{ signal }` to `sub()`, `once()`, or `collect()` to automatically clean up subscriptions:
+Pass `{ signal }` to `sub()` or `once()` to automatically clean up subscriptions:
 
 ```ts
 const controller = new AbortController();
@@ -119,7 +103,7 @@ pubsub.sub("ping", () => console.log("pong"), {
   signal: controller.signal,
 });
 
-// Promise-based once() and collect() reject with signal.reason (or AbortError) when aborted
+// Promise-based once() rejects with signal.reason (or AbortError) when aborted
 const loginPromise = pubsub.once("user:login", {
   signal: controller.signal,
 });
@@ -129,18 +113,26 @@ controller.abort();
 
 ### Async Iteration (`for await...of`)
 
-Calling `sub(topic)` without a callback returns an `AsyncGenerator` yielding event argument tuples (aborting `signal` ends iteration cleanly):
+Calling `sub(topic)` without a callback returns an `AsyncGenerator` yielding event argument tuples. It supports `{ signal, filter, max, time, idle }`:
 
 ```ts
-const controller = new AbortController();
-
+// Take up to 5 non-bot messages, stopping after 2s total or 500ms of inactivity
 for await (const [user, text] of pubsub.sub("chat:message", {
-  signal: controller.signal,
+  max: 5,
+  time: 2000,
+  idle: 500,
   filter: (user) => user !== "bot",
 })) {
   console.log(`${user}: ${text}`);
 }
+
+// Or collect into an array with Array.fromAsync()
+const batch = await Array.fromAsync(
+  pubsub.sub("chat:message", { max: 5, idle: 500 }),
+);
 ```
+
+Aborting `signal` ends iteration cleanly without throwing.
 
 Iterate over the `PubSub` instance directly to receive **all** topics as discriminated `[topic, ...args]` tuples:
 
@@ -198,22 +190,24 @@ Creates a new `PubSub` instance. `T` maps topic keys to argument tuple types (e.
 
 ### `SubOptions<Args>`
 
+Used by callback `sub()` and `once()`:
+
 | Option | Type | Description |
 | --- | --- | --- |
-| `signal` | `AbortSignal` | Automatically unsubscribes (or rejects/ends depending on API) when aborted. |
+| `signal` | `AbortSignal` | Unsubscribes (or rejects for promise `once()`) when aborted. |
 | `filter` | `(...args: Args) => boolean` | Predicate evaluated before delivering an event. |
 
-### `collect(pubsub, topic, options?)`
+### `SubIterOptions<Args>`
 
-Collects matching events on `topic` into a `Promise<T[K][]>`. Supports all `SubOptions` plus:
+Extends `SubOptions<Args>` for `sub(topic, options?)`:
 
 | Option | Type | Description |
 | --- | --- | --- |
-| `max` | `number` | Maximum number of matching events to collect before resolving. |
-| `time` | `number` | Maximum total time in milliseconds before resolving with collected events. |
-| `idle` | `number` | Inactivity timeout in milliseconds (resets on each matching event) before resolving. |
+| `max` | `number` | Maximum number of matching events to yield before ending iteration. |
+| `time` | `number` | Maximum total duration in milliseconds before ending iteration. |
+| `idle` | `number` | Inactivity timeout in milliseconds (resets on each matching event) before ending iteration. |
 
-If `max`, `time`, or `idle` is `<= 0` (and `signal` is not aborted), `collect()` resolves immediately with `[]`. Passing `Infinity` for `time` or `idle` disables that timer.
+If `max`, `time`, or `idle` is `<= 0`, the generator ends immediately without yielding. Passing `Infinity` for `time` or `idle` disables that timer.
 
 ## License
 

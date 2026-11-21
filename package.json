@@ -1,6 +1,6 @@
 {
   "name": "@syjalo/pubsub",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Type-safe PubSub with AsyncGenerator and Web Streams support",
   "type": "module",
   "types": "./dist/index.d.ts",
