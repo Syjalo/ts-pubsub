@@ -1,14 +1,19 @@
-import type { LimitOptions } from "./types.js";
-import { noop, onAbort } from "./utils.js";
+import type { DisposableAsyncGenerator, LimitOptions } from "./types.js";
+import { abortError, noop, onAbort } from "./utils.js";
 
 export type SubscribeSource<U> = (
   push: (item: U) => void,
   onClear: () => void,
 ) => () => void;
 
+function normalizeMax(max: number | undefined): number | undefined {
+  return max !== undefined && Number.isFinite(max) ? Math.floor(max) : max;
+}
+
 function hasExhaustedLimits(limits?: LimitOptions): boolean {
   if (!limits) return false;
-  const { max, duration, idle } = limits;
+  const { duration, idle } = limits;
+  const max = normalizeMax(limits.max);
   return (
     (max !== undefined && !(max > 0)) ||
     (duration !== undefined && !(duration > 0)) ||
@@ -21,7 +26,8 @@ function createIterController(
   onEnd: () => void,
   onAbortCallback: (reason: unknown) => void = onEnd,
 ) {
-  const { signal, max, duration, idle } = options ?? {};
+  const { signal, duration, idle } = options ?? {};
+  const max = normalizeMax(options?.max);
   let count = 0;
   let disposed = false;
   let durationTimer: ReturnType<typeof setTimeout> | undefined;
@@ -158,7 +164,9 @@ export function createWritableStream<U>(
       iter.start();
     },
     write: (chunk) => {
-      if (ended) return;
+      if (ended) {
+        throw abortError("Cannot write: stream limits are exhausted");
+      }
       try {
         if (filter && !filter(chunk)) return;
         publish(chunk);
@@ -176,9 +184,11 @@ export function createWritableStream<U>(
 export function createAsyncGenerator<U>(
   subscribe: SubscribeSource<U>,
   options?: LimitOptions,
-): AsyncGenerator<U> {
+): DisposableAsyncGenerator<U> {
   if (options?.signal?.aborted || hasExhaustedLimits(options)) {
-    return (async function* () {})();
+    const empty = (async function* () {})() as DisposableAsyncGenerator<U>;
+    empty[Symbol.dispose] = noop;
+    return empty;
   }
 
   let queue: U[] = [];
@@ -264,5 +274,10 @@ export function createAsyncGenerator<U>(
     return baseThrow(err);
   };
 
-  return generator;
+  const disposable = generator as DisposableAsyncGenerator<U>;
+  disposable[Symbol.dispose] = () => {
+    abort();
+    baseReturn(undefined).catch(noop);
+  };
+  return disposable;
 }

@@ -5,6 +5,7 @@ import {
   type SubscribeSource,
 } from "./streams.js";
 import type {
+  DisposableAsyncGenerator,
   StreamOptions,
   SubscribeOptions,
   TopicMap,
@@ -13,6 +14,7 @@ import type {
   WildcardStreamOptions,
 } from "./types.js";
 import {
+  abortError,
   isWildcardArgs,
   noopUnsubscribe,
   onAbort,
@@ -31,32 +33,48 @@ interface WildcardSubscription<T extends Record<keyof T, unknown[]>> {
   dispatch: (message: TopicMessage<T>) => void;
 }
 
-export class PubSub<
-  T extends Record<keyof T, unknown[]> = TopicMap,
-> implements Disposable {
+export class PubSub<T extends Record<keyof T, unknown[]> = TopicMap>
+  implements Disposable
+{
   #topicSubscriptions = new Map<keyof T, Set<TopicSubscription>>();
   #wildcardSubscriptions = new Set<WildcardSubscription<T>>();
 
   public publish<K extends keyof T>(topic: K, ...args: T[K]): void {
+    let errors: unknown[] | undefined;
+
     const subscriptions = this.#topicSubscriptions.get(topic);
     if (subscriptions) {
       for (const subscription of [...subscriptions]) {
-        subscription.dispatch(args);
+        try {
+          subscription.dispatch(args);
+        } catch (err) {
+          (errors ??= []).push(err);
+        }
       }
     }
 
     if (this.#wildcardSubscriptions.size > 0) {
-      const message = [topic, ...args] as TopicMessage<T>;
       for (const subscription of [...this.#wildcardSubscriptions]) {
-        subscription.dispatch(message);
+        const message = [topic, ...args] as TopicMessage<T>;
+        try {
+          subscription.dispatch(message);
+        } catch (err) {
+          (errors ??= []).push(err);
+        }
       }
+    }
+
+    if (errors) {
+      throw errors.length === 1
+        ? errors[0]
+        : new AggregateError(errors, "Errors thrown during publish");
     }
   }
 
   public subscribe<K extends keyof T>(
     topic: K,
     options?: StreamOptions<T[K]>,
-  ): AsyncGenerator<T[K]>;
+  ): DisposableAsyncGenerator<T[K]>;
   public subscribe<K extends keyof T>(
     topic: K,
     subscriber: (...args: T[K]) => void,
@@ -66,7 +84,7 @@ export class PubSub<
     topic: K,
     subscriberOrOptions?: ((...args: T[K]) => void) | StreamOptions<T[K]>,
     options?: SubscribeOptions<T[K]>,
-  ): Unsubscribe | AsyncGenerator<T[K]> {
+  ): Unsubscribe | DisposableAsyncGenerator<T[K]> {
     if (typeof subscriberOrOptions !== "function") {
       return createAsyncGenerator(
         this.#createTopicSource(topic, subscriberOrOptions?.filter),
@@ -161,7 +179,7 @@ export class PubSub<
     return [...this.#topicSubscriptions.keys()];
   }
 
-  public [Symbol.asyncIterator](): AsyncGenerator<TopicMessage<T>> {
+  public [Symbol.asyncIterator](): DisposableAsyncGenerator<TopicMessage<T>> {
     return createAsyncGenerator(this.#createWildcardSource());
   }
 
@@ -243,17 +261,31 @@ export class PubSub<
         return true;
       };
 
+      const safeFilter = filter
+        ? (...args: T[K]): boolean => {
+            try {
+              return filter(...args);
+            } catch (err) {
+              if (trySettle()) {
+                unsubscribe();
+                reject(err);
+              }
+              return false;
+            }
+          }
+        : undefined;
+
       const unsubscribe = this.#addSubscription(
         topic,
         (...args) => {
           if (trySettle()) resolve(args);
         },
         {
-          filter,
+          filter: safeFilter,
           once: true,
           onClear: () => {
             if (trySettle()) {
-              reject(new DOMException("Subscription cleared", "AbortError"));
+              reject(abortError("Subscription cleared"));
             }
           },
         },

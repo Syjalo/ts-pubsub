@@ -1,5 +1,6 @@
-export { PubSub } from "./subsub.js";
+export { PubSub } from "./pubsub.js";
 export type {
+  DisposableAsyncGenerator,
   LimitOptions,
   StreamOptions,
   SubscribeOptions,

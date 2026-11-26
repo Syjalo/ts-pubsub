@@ -2,7 +2,12 @@ import type { Unsubscribe } from "./types.js";
 
 export const noop = (): void => {};
 
-export const noopUnsubscribe: Unsubscribe = toUnsubscribe(() => {});
+export function toUnsubscribe(fn: () => void): Unsubscribe {
+  (fn as Unsubscribe)[Symbol.dispose] = fn;
+  return fn as Unsubscribe;
+}
+
+export const noopUnsubscribe: Unsubscribe = toUnsubscribe(noop);
 
 export function onAbort(
   signal: AbortSignal | undefined,
@@ -18,11 +23,11 @@ export function isWildcardArgs<K, O>(
 ): topicOrOptions is O | undefined {
   return (
     topicOrOptions === undefined ||
-    (typeof topicOrOptions === "object" && topicOrOptions !== null)
+    topicOrOptions === null ||
+    typeof topicOrOptions === "object"
   );
 }
 
-export function toUnsubscribe(fn: () => void): Unsubscribe {
-  (fn as Unsubscribe)[Symbol.dispose] = fn;
-  return fn as Unsubscribe;
+export function abortError(message: string): DOMException {
+  return new DOMException(message, "AbortError");
 }

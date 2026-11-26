@@ -6,6 +6,8 @@ export type TopicMessage<T extends Record<keyof T, unknown[]>> = {
 
 export type Unsubscribe = (() => void) & Disposable;
 
+export type DisposableAsyncGenerator<U> = AsyncGenerator<U> & Disposable;
+
 export interface LimitOptions {
   signal?: AbortSignal;
   max?: number;
@@ -19,7 +21,8 @@ export interface SubscribeOptions<Args extends unknown[] = unknown[]> {
 }
 
 export interface StreamOptions<Args extends unknown[] = unknown[]>
-  extends SubscribeOptions<Args>, LimitOptions {}
+  extends SubscribeOptions<Args>,
+    LimitOptions {}
 
 export interface WildcardStreamOptions<
   T extends Record<keyof T, unknown[]> = TopicMap,
